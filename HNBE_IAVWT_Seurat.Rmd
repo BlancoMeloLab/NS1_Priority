@@ -1,0 +1,549 @@
+---
+title: "NHBE IAV Seurat Analysis"
+output:
+  html_document:
+    keep_md: yes
+  pdf_document: default
+date: "2023-06-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(metap) # for finding cell type markers
+library(multtest) # for finding cell type markers
+library(ggplot2)
+library(cowplot)
+library(sctransform)
+library(SoupX)
+library(mixtools)
+library(MASS)
+library(RColorBrewer)
+library(ggsci)
+
+Vir <- c("PR8-PB2",	"PR8-PB1",	"PR8-PA",	"PR8-HA",	"PR8-NP",	"PR8-NA",	"PR8-M",	"PR8-NS")
+```
+
+## Read in PIPseq data and Run SoupX to remove multiplets
+
+Here we use SoupX to infer contamination with influenza genes as markers, this allows focus on influenza as the determining factor not cell-type. Refer to [this paper](https://journals.plos.org/plospathogens/article?id=10.1371/journal.ppat.1010943#sec009) for detailed description.
+
+Additional SoupX description can be found [here](https://rawcdn.githack.com/constantAmateur/SoupX/204b602418df12e9fdb4b68775a8b486c6504fe4/inst/doc/pbmcTutorial.html).
+
+For count adjustment, the `method` parameter controls how the removal of counts in performed. This should almost always be left at the default ('subtraction'), which iteratively subtracts counts from all genes as described above. The 'soupOnly' method will use a p-value based estimation procedure to identify those genes that can be confidently identified as having endogenous expression and removes everything else (described in greater detail below). Because this method either removes all or none of the expression for a gene in a cell, the correction procedure is much faster. Finally, the 'multinomial' method explicitly maximises the multinomial likelihood for each cell. This method gives essentially identical results as 'subtraction' and is considerably slower.
+
+```{r}
+RunSoupX = function (dir, name){
+  toc = Seurat::Read10X(data.dir = paste0(dir, "filtered_matrix/sensitivity_5/"))
+  tod = Seurat::Read10X(data.dir = paste0(dir, "raw_matrix/"))
+  sc = SoupChannel(tod, toc)
+  useToEst = estimateNonExpressingCells(sc, nonExpressedGeneList = list(Vir), clusters= F)
+  sc = calculateContaminationFraction(sc, list(Vir), useToEst = useToEst)
+  out = adjustCounts(sc)
+  return(CreateSeuratObject(out, project = name))
+}
+```
+
+```{r}
+# data_dir="~/OneDrive - Fred Hutchinson Cancer Research Center/Personal_OneDrive_BlancoMeloLab/Projects/NS1_priority/scRNAseq/out/NHBE_IAV30T/"
+# NHBE_IAV30T=RunSoupX(data_dir, "NHBE_IAV30T")
+# 
+# data_dir="~/OneDrive - Fred Hutchinson Cancer Research Center/Personal_OneDrive_BlancoMeloLab/Projects/NS1_priority/scRNAseq/out/NHBE_IAVWT/"
+# NHBE_IAVWT=RunSoupX(data_dir, "NHBE_IAVWT")
+# 
+# obj.combined=list(NHBE_IAV30T, NHBE_IAVWT)
+# 
+# saveRDS(obj.combined, file="./seurat_objects_soupX_corrected.rds")
+
+obj.combined = readRDS(file="./seurat_objects_soupX_corrected.rds")
+
+NHBE_IAVWT=obj.combined[[2]]
+```
+
+## Initial Data Filtering
+
+```{r}
+NHBE_IAVWT <- PercentageFeatureSet(NHBE_IAVWT, pattern = "^MT-", col.name = "percent.mt")
+NHBE_IAVWT<- PercentageFeatureSet(NHBE_IAVWT, pattern = "^RP[SL]", col.name = "percent.ribo")
+NHBE_IAVWT <- PercentageFeatureSet(NHBE_IAVWT, features = Vir, col.name = "percent.viral")
+
+```
+
+Visualize the input sample, which is already filtered through PIPSeeker at sensitivity 5, and soupX
+
+```{r}
+VlnPlot(NHBE_IAVWT, features=c("nCount_RNA", "nFeature_RNA",
+                                "percent.mt", "percent.viral"),
+        pt.size=0,
+        ncol=4,
+        log=F)
+```
+
+### Additional filtering using %mito, nCounts, nFeatures
+
+```{r}
+percent_mito <- 10
+NHBE_IAVWT <- subset(NHBE_IAVWT, subset = percent.mt < percent_mito)
+NHBE_IAVWT <- subset(NHBE_IAVWT, subset =  nCount_RNA > 2500 &  nCount_RNA < 25000)
+```
+
+Visualize basic parameters again to ensure the filtered cells look correct
+
+```{r}
+VlnPlot(NHBE_IAVWT, features=c("nCount_RNA", "nFeature_RNA",
+                                "percent.mt", "percent.viral"),
+        pt.size=0,
+        ncol=4,
+        log=F)
+```
+
+### SCT Transformation, remove confounding effect of total counts, and cell cycle genes.
+
+```{r, warning=FALSE}
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+NHBE_IAVWT <- SCTransform(NHBE_IAVWT, method="glmGamPoi", assay = 'RNA', new.assay.name = 'SCT', vars.to.regress = c('percent.mt', 'nFeature_RNA', 'nCount_RNA'))
+NHBE_IAVWT <- CellCycleScoring(NHBE_IAVWT, s.features = s.genes, g2m.features = g2m.genes, assay='SCT', set.ident = TRUE)
+
+# Since infected cells are within same phase, NS1 bins will be independent on the cell cyclescore, opt to skip regression on cell cycle scores
+NHBE_IAVWT <- SCTransform(NHBE_IAVWT, method="glmGamPoi", assay = 'RNA', new.assay.name = 'SCT', vars.to.regress = c('percent.mt', 'nFeature_RNA', 'nCount_RNA', 'S.Score', 'G2M.Score'))
+
+```
+
+### Run PCA and UMAP for individual samples.
+
+```{r, warning=FALSE}
+NHBE_IAVWT <- RunPCA(NHBE_IAVWT, features = NHBE_IAVWT@assays$SCT@var.features )
+ElbowPlot(NHBE_IAVWT, ndims = 40)
+```
+
+```{r}
+NHBE_IAVWT <- FindNeighbors(NHBE_IAVWT, features = NHBE_IAVWT@assays$SCT@var.features, dims = 1:15)
+NHBE_IAVWT <- RunUMAP(NHBE_IAVWT, dims = 1:15)
+NHBE_IAVWT <- FindClusters(NHBE_IAVWT, resolution=0.5)
+```
+
+## Save/load Data For Downstream Analysis
+
+```{r}
+# saveRDS(NHBE_IAVWT, "seurat_objects_NHBE_IAVWT_processed.rds")
+# NHBE_IAVWT <- readRDS(file="seurat_objects_NHBE_IAVWT_processed.rds")
+```
+
+### Visualize individual sample
+
+```{r, warning=FALSE}
+
+p1 = DimPlot(NHBE_IAVWT, group.by = 'Phase', reduction = "umap",label=F)& NoAxes()
+
+p2 = FeaturePlot(NHBE_IAVWT, features = c('percent.viral'), reduction = "umap",label=F, order = T,max.cutoff = 'q95')& NoAxes()
+
+p3 = DimPlot(NHBE_IAVWT, label = TRUE,reduction = 'umap') & NoAxes() & NoLegend()
+
+p4 = VlnPlot(NHBE_IAVWT, features = c(Vir), assay='SCT', ncol=3, pt.size = 0.0001)
+
+p5 = FeaturePlot(NHBE_IAVWT, features = c('IFNL1','IFIT1',"HSPA1B","PR8-NS")) & NoAxes() & NoLegend()
+
+p6 = DoHeatmap(NHBE_IAVWT, 
+          features = Vir, 
+          assay = 'RNA', 
+          slot = 'data')  # all viral expression below 0.8 is displayed as 0
+
+p1
+p2
+p3
+p4
+p5
+p6
+
+ggsave(plot=p2,device = "pdf",filename =  "./saves/percent_viral.pdf", height = 4, width = 4)
+
+```
+
+### Add modular score for different host response
+
+Using defined gene lists from bulk analysis
+
+```{r, warning=FALSE}
+gsea_ranked_ns1 = read.csv("gsea_ranked_ns1.csv")
+gsea_ranked_wt = read.csv("gsea_ranked_wt.csv")
+# 
+# gsea_ranked_ns1_sig = gsea_ranked_ns1[which(gsea_ranked_ns1$SCORE<(-1)),]
+# gsea_ranked_wt_sig = gsea_ranked_wt[which(gsea_ranked_wt$SCORE<(-1)),]
+
+gsea_ranked_ns1_sig = gsea_ranked_ns1[1:100,]
+gsea_ranked_wt_sig = gsea_ranked_wt[1:100,]
+
+gsea_ranked_ns1_sig=gsea_ranked_ns1_sig[which(!(gsea_ranked_ns1_sig$NAME %in% gsea_ranked_wt_sig$NAME)),]
+
+gsea_ranked_wt_sig=gsea_ranked_wt_sig[which(!(gsea_ranked_wt_sig$NAME %in% gsea_ranked_ns1_sig$NAME)),]
+
+```
+
+```{r, warning=FALSE}
+NHBE_IAVWT = AddModuleScore(NHBE_IAVWT, list(gsea_ranked_ns1_sig$NAME), assay = "SCT", name="NS1")
+NHBE_IAVWT = AddModuleScore(NHBE_IAVWT, list(gsea_ranked_wt_sig$NAME), assay = "SCT", name="WT")
+```
+
+```{r}
+NHBE_IAVWT_infected =  subset(x = NHBE_IAVWT, subset = (seurat_clusters == "5")|(seurat_clusters == "7"))
+library(scales)
+goi=c("NS11","WT1")
+p= FeaturePlot(NHBE_IAVWT_infected, features = goi, max.cutoff = "q99", order=F, pt.size = 0.1) & 
+  scale_colour_gradient2(midpoint = 0,   low = ("navy"), mid = "white", high = ("red")) &
+  NoAxes()
+
+p
+ggsave(plot=p,device = "pdf",filename =  "./saves/GSEA_gene_score.pdf", height = 3, width = 6)
+
+
+goi=c("PR8-NP","PR8-NS", "IFNB1","CCL20","ISG15","HSPA1B")
+p= FeaturePlot(NHBE_IAVWT_infected, features = goi, max.cutoff = "q99", order=T, pt.size = 0.5) & 
+  scale_colour_gradient2(midpoint = 0,   low = ("navy"), mid = "grey95", high = ("red")) &
+  NoAxes()
+
+p
+ggsave(plot=p,device = "pdf",filename =  "./saves/example_expression.pdf", height = 10, width = 7)
+
+```
+
+### Now separate out only infected cells to define the NS1 bins
+
+```{r}
+normalized_cts=NHBE_IAVWT[["SCT"]]@counts
+cell_meta=NHBE_IAVWT@meta.data
+```
+
+```{r}
+frac_viral = colSums(normalized_cts[Vir,])/colSums(normalized_cts)
+NHBE_IAVWT[["frac_viral"]]=frac_viral
+d = density(log10(frac_viral))
+cutoff_infected = optimize(approxfun(d$x,d$y),interval=c(-4,0))$minimum
+# cutoff_infected = -1
+frac_viral_df=data.frame(id=names(frac_viral),frac=frac_viral,label=cell_meta$orig.ident)
+
+p = ggplot(frac_viral_df, aes(x=log10(frac))) +geom_density(alpha=0.2, fill="red")+
+  geom_vline(aes(xintercept=(cutoff_infected)), linetype="dotted")+
+  theme_classic()
+
+p
+
+ggsave(plot=p,device = "pdf",filename =  "./saves/viral_fraction.pdf", height = 4, width = 4)
+```
+
+```{r}
+Infected=names(which(log10(frac_viral)>cutoff_infected))
+NHBE_IAVWT[["Infected"]] <- ifelse(colnames(NHBE_IAVWT) %in% Infected, "Infected", "ByStd")
+p = DimPlot(NHBE_IAVWT, group.by = 'Infected', reduction = 'umap', 
+        cols=c('royalblue1','deeppink','darkgray')) & NoAxes()
+
+p
+ggsave(plot=p, device = "pdf",filename =  "./saves/infected_cells.pdf", height = 4, width = 4)
+```
+
+```{r}
+cell_meta=NHBE_IAVWT@meta.data
+p = ggplot(cell_meta, aes(x = factor(Infected), fill = factor(Phase))) +
+geom_bar(position="fill") + geom_text(aes(label=signif(..count.. / tapply(..count.., ..x.., sum)[as.character(..x..)], digits=2)),stat="count",position=position_fill(vjust=0.5)) +
+theme_classic()
+p
+
+ggsave(plot=p, device = "pdf",filename =  "./saves/infected_cell_phase.pdf", height = 4, width = 4)
+```
+
+```{r}
+infected_meta = cell_meta[which(cell_meta$Infected=="Infected"),]
+infected_cts = normalized_cts[,rownames(infected_meta)]
+```
+
+```{r}
+expr_df = data.frame(id=rownames(infected_meta), ns1_resp=infected_meta$NS11, wt_resp=infected_meta$WT1 ,t(infected_cts))
+
+ggplot(expr_df, aes(x=log10(`PR8.NS`+1))) +geom_density(alpha=0.2,fill="pink")+theme_classic()
+```
+
+```{r}
+plot_mix_comps <- function(x, mu, sigma, lam) {
+  lam * dnorm(x, mu, sigma)
+}
+```
+
+```{r, warning=FALSE}
+L10NS1 = log10(expr_df$PR8.NS+1)
+
+# Find the local minimum for low NS1 expression
+d = density(L10NS1)
+cutoff_no_ns1 = optimize(approxfun(d$x,d$y),interval=c(0,1))$minimum
+
+# Find the local minimum for mid/high NS1 expression. This is done by fitting bimodal normal distributions on the rest of the data, and the cutoff is the intersection between two distributions
+x=L10NS1[L10NS1>cutoff_no_ns1]
+mixmdl = normalmixEM(x,k=2)
+
+plot_df=data.frame(x = mixmdl$x)
+
+distributions.plot =ggplot() +
+  geom_density(data=data.frame(x=L10NS1), aes(x), fill = "pink") +
+  stat_function(data = plot_df, geom = "line", fun = plot_mix_comps, args = list(mixmdl$mu[1], mixmdl$sigma[1], lam = mixmdl$lambda[1]), colour = "red", lwd = 1.5) +
+  stat_function(data = plot_df, geom = "line", fun = plot_mix_comps, args = list(mixmdl$mu[2], mixmdl$sigma[2], lam = mixmdl$lambda[2]), colour = "blue", lwd = 1.5) +
+  theme_classic()
+
+#extract coordinates of both lines from plot
+line.df = data.frame(x = ggplot_build(distributions.plot)$data[[2]]$x,
+                     red = ggplot_build(distributions.plot)$data[[2]]$y,
+                     blue = ggplot_build(distributions.plot)$data[[3]]$y)
+
+#find the minimal distance between lines along y axis
+line.df$delta = line.df$red - line.df$blue
+
+#find x coordinate for the minimal delta y
+x_coord = line.df$x[which(diff(sign(diff((abs(line.df$delta))))) == 2)+1]
+
+cutoff_mid_ns1 = x_coord[1]
+
+
+# cutoff_mid_ns1 = 2.5
+
+p = ggplot() +
+  geom_density(data=data.frame(x=L10NS1), aes(x), fill = "pink", alpha=0.2) +
+  stat_function(data = plot_df, geom = "line", fun = plot_mix_comps,
+                args = list(mixmdl$mu[1], mixmdl$sigma[1], lam = mixmdl$lambda[1]),
+                colour = "pink", alpha=0.8, lwd = 1.5) +
+  stat_function(data = plot_df, geom = "line", fun = plot_mix_comps,
+                args = list(mixmdl$mu[2], mixmdl$sigma[2], lam = mixmdl$lambda[2]),
+                colour = "red", alpha=0.5, lwd = 1.5) +
+  geom_vline(xintercept = c(cutoff_no_ns1, cutoff_mid_ns1), linetype="dotted") +
+  theme_classic()
+
+p
+
+ggsave(plot=p, device = "pdf",filename =  "./saves/ns1_cutoffs.pdf", height = 4, width = 4)
+```
+
+```{r}
+expr_df$NS1Bin=rep("Low",nrow(expr_df))
+expr_df$NS1Bin[which(log10(expr_df$`PR8.NS`+1)>=cutoff_no_ns1 & log10(expr_df$`PR8.NS`+1)<cutoff_mid_ns1)]="Mid"
+expr_df$NS1Bin[which(log10(expr_df$`PR8.NS`)>=cutoff_mid_ns1)]="High"
+expr_df$NS1Bin=factor(expr_df$NS1Bin, levels = c("Low","Mid","High"))
+summary(expr_df$NS1Bin)
+```
+
+```{r}
+NHBE_IAVWT[["NS1_levels"]] = "None"
+
+NS1_HI = expr_df$id[which(expr_df$NS1Bin=="High")]
+NS1_MID = expr_df$id[which(expr_df$NS1Bin=="Mid")]
+NS1_LOW = expr_df$id[which(expr_df$NS1Bin=="Low")]
+
+NHBE_IAVWT[["NS1_levels"]][NS1_HI,]="High"
+NHBE_IAVWT[["NS1_levels"]][NS1_MID,]="Mid"
+NHBE_IAVWT[["NS1_levels"]][NS1_LOW,]="Low"
+
+NHBE_IAVWT$NS1_levels=factor(NHBE_IAVWT$NS1_levels, levels =c("High","Mid","Low",'None'))
+
+p = DimPlot(NHBE_IAVWT, group.by = 'NS1_levels', reduction = 'umap',
+        cols = rev(c("pink","red1","red4",'gray90')), order = c("Low","Mid","High",'None')) & NoAxes()
+p
+
+ggsave(plot=p, device = "pdf",filename =  "./saves/ns1_levels.pdf", height = 6, width = 6)
+```
+
+```{r}
+NHBE_IAVWT_infected =  subset(x = NHBE_IAVWT, subset = Infected == "Infected")
+
+
+cell_meta = NHBE_IAVWT_infected@meta.data
+df = data.frame(cell_meta, t(NHBE_IAVWT_infected[["SCT"]]@counts[Vir,]))
+df$NS1_levels=factor(df$NS1_levels, levels=c("Low","Mid","High"))
+
+p = ggplot(df, aes(x=log10(frac_viral), y=log10(PR8.NP+1), color=NS1_levels)) +
+  geom_point() +
+  scale_color_manual(values = c("pink","red1","red4")) +
+  theme_classic()
+p
+ggsave(plot=p,device = "pdf",filename =  "./saves/viral_frac_v_NP.pdf", height = 4, width = 3)
+
+p = ggplot(df, aes(x=log10(frac_viral), y=log10(PR8.NS+1), color=NS1_levels)) +
+  geom_point() +
+  scale_color_manual(values = c("pink","red1","red4")) +
+  theme_classic()
+p
+ggsave(plot=p,device = "pdf",filename =  "./saves/viral_frac_v_NS.pdf", height = 4, width = 3)
+
+
+p = ggplot(df, aes(x=log10(frac_viral), y=WT1, color=NS1_levels)) +
+  geom_point(size=1) +
+  scale_color_manual(values = c("pink","red1","red4")) +
+  # geom_smooth(method=lm, se=TRUE,  size=1, alpha=0.5)+
+  theme_classic()
+p
+ggsave(plot=p,device = "pdf",filename =  "./saves/viral_frac_v_WTresp.pdf", height = 4, width = 4)
+
+
+p = ggplot(df, aes(x=log10(frac_viral), y=NS11, color=NS1_levels)) +
+  geom_point(size=1) +
+  scale_color_manual(values = c("pink","red1","red4")) +
+  # geom_smooth(method=lm, se=TRUE,  size=1, alpha=0.5)+
+  theme_classic()
+p
+ggsave(plot=p,device = "pdf",filename =  "./saves/viral_frac_v_NS1resp.pdf", height = 4, width = 4)
+```
+
+### Examine marker gene expression given the current NS1 definition
+
+```{r}
+
+ggplot(data=expr_df, aes(x=NS1Bin, y=log10(IFNB1+1))) +
+  geom_bar(position = "dodge", stat = "summary", fun = "mean") +
+  theme_classic()
+```
+
+```{r}
+expr_all=data.frame(NHBE_IAVWT@meta.data, t(normalized_cts))
+rownames(expr_all)=rownames(NHBE_IAVWT@meta.data)
+
+```
+
+```{r}
+
+NHBE_IAVWT_infected$NS1_levels=factor(NHBE_IAVWT_infected$NS1_levels, levels= c("High","Mid","Low"))
+
+# ns1 response cutoff
+cutoff_ns1_resp = quantile(cell_meta[which(cell_meta$NS1_levels=="High"),]$NS11,probs = 0.95)
+
+# wt response cutoff
+cutoff_wt_resp = quantile(cell_meta[which(cell_meta$NS1_levels=="High"),]$WT1,probs = 0.95)
+
+p1 = VlnPlot(NHBE_IAVWT_infected, group.by = "NS1_levels", features = "NS11", cols = rev(c("pink","red1","red4"))) &
+  ylim(c(-0.2,0.5)) &
+  geom_hline(yintercept = cutoff_ns1_resp)
+
+
+p2 = VlnPlot(NHBE_IAVWT_infected, group.by = "NS1_levels", features = "WT1", cols = rev(c("pink","red1","red4"))) &
+  ylim(c(-0.2,0.5)) &
+  geom_hline(yintercept = cutoff_ns1_resp)
+
+ggsave(plot=p1+p2,device = "pdf",filename =  "./saves/violin_NS1_WT1_scores.pdf", height = 6, width = 3)
+p1+p2
+
+NHBE_IAVWT_infected$NS1_levels=factor(NHBE_IAVWT_infected$NS1_levels, levels= rev(c("High","Mid","Low")))
+
+p3 = RidgePlot(NHBE_IAVWT_infected, group.by = "NS1_levels", features = "NS11", cols = rev(c("red4","red1","pink"))) &
+  geom_vline(xintercept = cutoff_ns1_resp)
+p4 = RidgePlot(NHBE_IAVWT_infected, group.by = "NS1_levels", features = "WT1", cols = rev(c("red4","red1","pink"))) &
+  geom_vline(xintercept = cutoff_wt_resp)
+ 
+p3+p4
+ggsave(plot=p3+p4,device = "pdf",filename =  "./saves/ridge_NS1_WT1_scores.pdf", height = 6, width = 3)
+
+```
+
+### Instead of the generic IFN/ISG/UPR score, run the same comparison using GSEA results from bulk analysis
+
+Here **NS1** means WT, NS-T vs dNS1 - genes can be silenced with any amount of NS1. And **WT** means WT vs NS-T, dNS1 - genes to be silenced by the largest amount of NS1
+
+```{r}
+cell_meta=NHBE_IAVWT@meta.data
+
+
+ggplot(cell_meta[which(cell_meta$NS1_levels=="High"),], aes(x=NS11)) +
+geom_density(alpha=0.2, fill="red") +
+geom_vline(aes(xintercept=cutoff_ns1_resp)) +
+theme_classic()
+
+ggplot(cell_meta[which(cell_meta$NS1_levels=="High"),], aes(x=WT1)) +
+geom_density(alpha=0.2, fill="red")+
+geom_vline(aes(xintercept=cutoff_wt_resp)) +
+theme_classic()
+```
+
+```{r}
+
+NS1_resp_pos = rownames(cell_meta)[which(cell_meta$NS11>cutoff_ns1_resp)]
+NHBE_IAVWT[["NS1_resp"]] <- ifelse(colnames(NHBE_IAVWT) %in% NS1_resp_pos, "NS1_Resp+", "NS1_Resp-")
+DimPlot(NHBE_IAVWT, group.by = 'NS1_resp', reduction = 'umap', 
+        cols=c('royalblue1','deeppink','darkgray')) & NoAxes()
+
+WT_resp_pos = rownames(cell_meta)[which(cell_meta$WT1>cutoff_wt_resp)]
+NHBE_IAVWT[["WT_resp"]] <- ifelse(colnames(NHBE_IAVWT) %in% WT_resp_pos, "WT_resp+", "WT_resp-")
+DimPlot(NHBE_IAVWT, group.by = 'WT_resp', reduction = 'umap', 
+        cols=c('royalblue1','deeppink','darkgray')) & NoAxes()
+```
+
+```{r}
+cell_meta = NHBE_IAVWT@meta.data
+cell_meta=cell_meta[which(cell_meta$Infected=="Infected"),]
+# write.csv(infected_meta, 'infected_meta.csv')
+
+p1 = cell_meta %>% mutate(NS1_levels= factor(NS1_levels,levels=c("High","Mid","Low"))) %>% group_by(NS1_levels) %>%
+  count(NS1_resp) %>%
+  mutate(pct = n/sum(n)) %>%
+  filter(NS1_resp == "NS1_Resp+")%>%
+  ggplot(aes(NS1_levels, pct))+
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = scales::percent(pct)), vjust = -0.3) +
+    ggtitle("Percent Postive - Any NS1 Resp") +
+    ylim(c(0,0.5))+
+    theme_classic()
+
+
+p2 = cell_meta %>% mutate(NS1_levels= factor(NS1_levels,levels=c("High","Mid","Low"))) %>% group_by(NS1_levels) %>%
+  count(WT_resp) %>%
+  mutate(pct = n/sum(n)) %>%
+  filter(WT_resp == "WT_resp+")%>%
+  ggplot(aes(NS1_levels, pct))+
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = scales::percent(pct)), vjust = -0.3) +
+    ggtitle("Percent Postive - WT Resp") +
+    ylim(c(0,0.5))+
+    theme_classic()
+p1 + p2
+
+ggsave(plot=p1 + p2,device = "pdf",filename =  "./saves/Percent_Postive_GSEA_Resp.pdf", height = 4, width = 8)
+
+```
+
+## Plot a heat map of NS1/WT genes with NS1 by bins
+
+```{r, warning=F}
+gsea_ns1_sig_heatmap = gsea_ranked_ns1
+gsea_wt_sig_heatmap = gsea_ranked_wt
+
+myBreaks = seq(-1, 1, by = .2)
+col=colorRampPalette(c("navy","white", "red"))(length(myBreaks))
+
+
+# Any NS1
+test=AverageExpression(NHBE_IAVWT,features = (gsea_ns1_sig_heatmap$NAME), assay="SCT",slot = "counts",group.by ="NS1_levels")[[1]]
+test=data.frame(test)
+
+test=test[which(rowSums(test[,1:3])>1),]
+p = pheatmap::pheatmap(test[1:20,1:3],
+                   show_colnames = T,
+                   cluster_cols = F,
+                   color = col, 
+                   scale="row",border_color = "black",
+                    treeheight_row = 5,
+                   breaks = myBreaks)
+p
+ggsave(plot=p,device = "pdf",filename =  "./saves/heatmap_ns1resp.pdf", height = 4, width = 4)
+
+# WT only
+test=AverageExpression(NHBE_IAVWT,features = (gsea_wt_sig_heatmap$NAME), assay="SCT",slot = "counts",group.by ="NS1_levels")[[1]]
+test=data.frame(test)
+
+test=test[which(rowSums(test[,1:3])>1),]
+p = pheatmap::pheatmap(test[1:20,1:3],
+                   show_colnames = T,
+                   cluster_cols = F,
+                   color = col, 
+                   scale="row",border_color = "black",
+                   treeheight_row = 5,
+                   breaks = myBreaks)
+p
+ggsave(plot=p,device = "pdf",filename =  "./saves/heatmap_wtresp.pdf", height = 4, width = 4)
+```
